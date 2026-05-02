@@ -1,83 +1,140 @@
+"""
+services/video_processor.py
+============================
+Background processor that runs the ML pipeline on a queued video job.
+
+Key changes:
+  • Reads camera_lat / camera_lng from the job record and passes to model_runner.run()
+  • Stores plates_detected count in VideoResultORM
+  • Stores full detection list (with plate fields) in raw_json
+"""
 from __future__ import annotations
-from datetime import datetime
+
+import json
+import logging
 import time
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy.orm import Session
-from app.core.logging import job_log_path, log_job_event
+
 from app.db.models import VideoJobORM, VideoResultORM
-from app.ml import ModelRunResult, get_model_runner
-from app.models.schemas import ProcessingStatus, VideoResult
+from app.db.session import SessionLocal
+from app.ml.model_runner import get_model_runner
+
+logger = logging.getLogger("app.services.video_processor")
+
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 
-def analyze_video(db: Session, job: VideoJobORM) -> VideoResult:
-    video_path = Path(job.storage_path)
-    artifact_dir = video_path.parent / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-
-    job.artifact_dir = str(artifact_dir)
-    if not job.log_path:
-        job.log_path = str(job_log_path(job.id))
-    job.progress = 10
-    job.updated_at = datetime.utcnow()
-    db.add(job)
-    db.commit()
-
-    log_job_event(job.id, "job_received", video=str(video_path))
-
-    start = time.perf_counter()
-    runner = get_model_runner()
-    log_job_event(job.id, "model_loading", device=runner.config.device)
-
+def process_job(job_id: int) -> None:
+    """
+    Main entry point called by your task queue / background worker.
+    """
+    db = SessionLocal()
     try:
-        result = runner.run(video_path=video_path, artifacts_dir=artifact_dir)
-    except Exception as exc:
-        log_job_event(job.id, "model_failed", error=str(exc))
-        raise
+        job: VideoJobORM = db.query(VideoJobORM).filter_by(id=job_id).first()
+        if not job:
+            logger.error(f"Job {job_id} not found in DB.")
+            return
 
-    duration_ms = int((time.perf_counter() - start) * 1000)
-    job.progress = 95
-    job.duration_ms = duration_ms
-    job.updated_at = datetime.utcnow()
-    db.add(job)
-
-    log_job_event(job.id, "model_completed", summary=result.summary, metrics=result.metrics)
-
-    db_result = _upsert_result(db, job.id, result)
-    job.progress = 100
-    job.status = ProcessingStatus.completed
-    job.updated_at = datetime.utcnow()
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    return VideoResult.model_validate(db_result)
-
-
-def _upsert_result(db: Session, job_id: int, run_result: ModelRunResult) -> VideoResultORM:
-    payload = run_result.to_dict()
-    existing = db.query(VideoResultORM).filter_by(job_id=job_id).first()
-
-    if existing:
-        existing.summary = run_result.summary
-        existing.raw_json = payload
-        existing.reid_groups = run_result.reid_groups
-        existing.trajectory = run_result.trajectory
-        existing.unique_vehicles = len(run_result.reid_groups)
-        existing.created_at = datetime.utcnow()
-        db.add(existing)
+        # ── mark processing ───────────────────────────────────────────────
+        job.status = "processing"
+        job.progress = 5
         db.commit()
-        db.refresh(existing)
-        return existing
 
-    result = VideoResultORM(
-        job_id=job_id,
-        summary=run_result.summary,
-        raw_json=payload,
-        reid_groups=run_result.reid_groups,
-        trajectory=run_result.trajectory,
-        unique_vehicles=len(run_result.reid_groups),
-        created_at=datetime.utcnow(),
-    )
-    db.add(result)
-    db.commit()
-    db.refresh(result)
-    return result
+        video_path = Path(job.storage_path)
+        artifacts_dir = BASE_DIR / "storage" / "videos" / str(job_id) / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── build camera_location from job record ─────────────────────────
+        camera_location = None
+        if job.camera_lat and job.camera_lng:
+            camera_location = {
+                "lat": job.camera_lat,
+                "lng": job.camera_lng,
+                "name": job.camera_name or f"Camera – Job {job_id}",
+            }
+
+        # ── run ML pipeline ───────────────────────────────────────────────
+        t0 = time.perf_counter()
+        runner = get_model_runner()
+
+        job.progress = 20
+        db.commit()
+
+        result = runner.run(
+            video_path=video_path,
+            artifacts_dir=artifacts_dir,
+            camera_location=camera_location,
+        )
+
+        job.progress = 90
+        db.commit()
+
+        # ── serialize ─────────────────────────────────────────────────────
+        detections_raw = [asdict(d) for d in result.detections]
+        # Convert tuple bboxes to lists for JSON
+        for d in detections_raw:
+            if isinstance(d.get("bbox"), tuple):
+                d["bbox"] = list(d["bbox"])
+
+        raw_json = {
+            "summary": result.summary,
+            "frames_processed": result.frames_processed,
+            "gallery_size": result.gallery_size,
+            "metrics": result.metrics,
+            "reid_groups": result.reid_groups,
+            "trajectory": result.trajectory,
+            "detections": detections_raw,
+        }
+
+        plates_detected = sum(1 for d in result.detections if d.plate_number)
+
+        # ── save result ───────────────────────────────────────────────────
+        db_result = VideoResultORM(
+            job_id=job_id,
+            summary=result.summary,
+            raw_json=raw_json,
+            unique_vehicles=len(result.reid_groups),
+            reid_groups=result.reid_groups,
+            trajectory=result.trajectory,
+            plates_detected=plates_detected,
+        )
+        db.add(db_result)
+
+        # ── update job ────────────────────────────────────────────────────
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        job.status = "completed"
+        job.progress = 100
+        job.duration_ms = elapsed_ms
+        job.artifact_dir = str(artifacts_dir)
+        db.commit()
+
+        logger.info(
+            f"Job {job_id} completed: {result.frames_processed} frames, "
+            f"{len(result.detections)} detections, "
+            f"{len(result.reid_groups)} vehicles, "
+            f"{plates_detected} plates in {elapsed_ms}ms"
+        )
+
+    except Exception as exc:
+        logger.exception(f"Job {job_id} failed: {exc}")
+        try:
+            job.status = "failed"
+            job.error_message = str(exc)
+            db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def enqueue_job(job_id: int) -> None:
+    """
+    Called from the upload endpoint to start processing.
+    Uses a simple thread for development; swap for Celery/RQ in production.
+    """
+    import threading
+    t = threading.Thread(target=process_job, args=(job_id,), daemon=True)
+    t.start()
+    logger.info(f"Enqueued job {job_id} for processing.")

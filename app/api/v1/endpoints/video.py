@@ -1,348 +1,252 @@
+"""
+api/v1/endpoints/video.py
+=========================
+Fixed to handle old DB records (no artifact_dir, no plates_detected, etc.)
+"""
 from __future__ import annotations
 
-from datetime import datetime
 import json
+import logging
+import uuid
 from pathlib import Path
-from typing import Annotated
 
-from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    Depends,
-    File,
-    Form,
-    HTTPException,
-    UploadFile,
-    status,
-)
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
-from app.core.logging import log_job_event, reset_job_log
 from app.db.models import VideoJobORM, VideoResultORM
-from app.db.session import get_db, Base, engine
-from app.models.schemas import (
-    Envelope,
-    ErrorResponse,
-    ProcessingStatus,
-    VideoJob,
-    VideoJobCreate,
-    VideoJobListItem,
-    VideoResult,
-    VideoResultWithArtifacts,
-)
-from app.services.video_processor import analyze_video
+from app.db.session import get_db
+from app.models.schemas import Envelope, ErrorResponse, VideoJob, VideoJobListItem
 
+logger = logging.getLogger("app.api.video")
 router = APIRouter()
 
-
-# Ensure tables exist at import time for simplicity in this MVP.
-Base.metadata.create_all(bind=engine)
-
-
-def _ensure_storage_dir() -> Path:
-    settings.VIDEO_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    return settings.VIDEO_STORAGE_DIR
+# video.py lives at Backend/app/api/v1/endpoints/video.py
+# parents[4] = Backend/  but storage is at VehicleReIdenti/storage (one level up)
+BASE_DIR = Path(__file__).resolve().parents[4]
 
 
-def _resolve_artifact_dir(job: VideoJobORM) -> Path:
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _job_or_404(job_id: int, db: Session) -> VideoJobORM:
+    job = db.query(VideoJobORM).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ErrorResponse(code="not_found", message="Job not found.").model_dump(),
+        )
+    return job
+
+
+def _artifact_url(rel_path: str) -> str:
+    return f"/static/storage/{rel_path}"
+
+
+def _find_artifacts(job: VideoJobORM) -> list[dict]:
+    """Find artifact images on disk, robust to missing/old artifact_dir."""
+    items = []
+
+    # Try explicit artifact_dir first
     if job.artifact_dir:
-        return Path(job.artifact_dir)
-    return Path(job.storage_path).parent / "artifacts"
+        art_dir = Path(job.artifact_dir)
+        if art_dir.exists():
+            for img in sorted(art_dir.glob("*.jpg")):
+                try:
+                    rel = img.relative_to(BASE_DIR / "storage")
+                    items.append({"filename": img.name, "url": _artifact_url(str(rel))})
+                except ValueError:
+                    items.append({
+                        "filename": img.name,
+                        "url": f"/static/storage/videos/{job.id}/artifacts/{img.name}"
+                    })
+            return items
+
+    # Fallback: look in standard location
+    standard = BASE_DIR / "storage" / "videos" / str(job.id) / "artifacts"
+    if standard.exists():
+        for img in sorted(standard.glob("*.jpg")):
+            items.append({
+                "filename": img.name,
+                "url": f"/static/storage/videos/{job.id}/artifacts/{img.name}"
+            })
+
+    return items
 
 
-def _artifact_url(job_id: int, filename: str) -> str:
-    return f"{settings.API_V1_PREFIX}/videos/{job_id}/artifacts/{filename}"
+# ── list ──────────────────────────────────────────────────────────────────────
 
-
-def _read_log_entries(log_path: Path, limit: int) -> list[dict]:
-    if limit <= 0:
-        return []
-    if not log_path.exists():
-        return []
-    with log_path.open("r", encoding="utf-8") as fp:
-        lines = fp.readlines()[-limit:]
-    entries: list[dict] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            entries.append({"event": "raw", "message": line})
-    return entries
-
-
-@router.post(
-    "",
-    response_model=Envelope,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_video_job(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    title: Annotated[str, Form()] = "",
-    description: Annotated[str | None, Form()] = None,
+@router.get("", response_model=Envelope)
+def list_videos(
+    page: int = 1,
+    page_size: int = 20,
+    status_filter: str | None = None,
     db: Session = Depends(get_db),
 ) -> Envelope:
-    if not file.content_type or not file.content_type.startswith("video/"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ErrorResponse(
-                code="invalid_file_type",
-                message="Only video files are allowed.",
-            ).model_dump(),
-        )
+    q = db.query(VideoJobORM).order_by(VideoJobORM.created_at.desc())
+    if status_filter:
+        q = q.filter_by(status=status_filter)
+    jobs = q.offset((page - 1) * page_size).limit(page_size).all()
+    return Envelope(data=[VideoJobListItem.model_validate(j) for j in jobs])
 
-    storage_root = _ensure_storage_dir()
-    now = datetime.utcnow()
 
+# ── upload ────────────────────────────────────────────────────────────────────
+
+@router.post("", response_model=Envelope, status_code=status.HTTP_201_CREATED)
+async def upload_video(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    description: str | None = Form(default=None),
+    camera_location: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> Envelope:
+    # Parse camera location
+    cam_lat = cam_lng = cam_name = None
+    if camera_location:
+        try:
+            loc = json.loads(camera_location)
+            cam_lat = float(loc.get("lat") or 0) or None
+            cam_lng = float(loc.get("lng") or 0) or None
+            cam_name = str(loc.get("name") or "").strip() or None
+        except Exception as exc:
+            logger.warning(f"Could not parse camera_location: {exc}")
+
+    # Save file
+    storage_dir = BASE_DIR / "storage" / "videos"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(file.filename or "upload.mp4").name
+    dest = storage_dir / f"{uuid.uuid4().hex}_{safe_name}"
+    dest.write_bytes(await file.read())
+
+    # Create job
     job = VideoJobORM(
         title=title,
         description=description,
-        original_filename=file.filename,
-        storage_path="",  # placeholder until we know the path
-        status=ProcessingStatus.queued,
-        created_at=now,
-        updated_at=now,
+        status="queued",
+        progress=0,
+        original_filename=file.filename or "upload.mp4",
+        storage_path=str(dest),
+        camera_lat=cam_lat,
+        camera_lng=cam_lng,
+        camera_name=cam_name,
     )
     db.add(job)
     db.commit()
     db.refresh(job)
 
-    job_dir = storage_root / str(job.id)
-    job_dir.mkdir(parents=True, exist_ok=True)
-    video_path = job_dir / "source.mp4"
-    log_path = reset_job_log(job.id)
-    job.log_path = str(log_path)
+    _enqueue_processing(job.id)
 
-    contents = await file.read()
-    with video_path.open("wb") as f:
-        f.write(contents)
-
-    job.storage_path = str(video_path)
-    job.status = ProcessingStatus.processing
-    job.updated_at = datetime.utcnow()
-    job.progress = 5
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-
-    log_job_event(
-        job.id,
-        "upload_saved",
-        filename=file.filename,
-        bytes=len(contents),
-    )
-
-    def process_job(job_id: int) -> None:
-        session: Session = next(get_db())
-        try:
-            db_job = session.get(VideoJobORM, job_id)
-            if not db_job:
-                return
-            log_job_event(job_id, "background_task_started")
-            analyze_video(session, db_job)
-            session.commit()
-            log_job_event(job_id, "job_completed")
-        except Exception as exc:  # noqa: BLE001
-            db_job = session.get(VideoJobORM, job_id)
-            if db_job:
-                db_job.status = ProcessingStatus.failed
-                db_job.error_message = str(exc)
-                db_job.updated_at = datetime.utcnow()
-                session.add(db_job)
-                session.commit()
-                log_job_event(job_id, "job_failed", error=str(exc))
-        finally:
-            session.close()
-
-    background_tasks.add_task(process_job, job.id)
-    log_job_event(job.id, "background_task_enqueued")
-
+    logger.info(f"Uploaded job_id={job.id} camera=({cam_lat},{cam_lng})")
     return Envelope(data=VideoJob.model_validate(job))
 
 
-@router.get("", response_model=Envelope)
-def list_video_jobs(
-    page: int = 1,
-    page_size: int = 10,
-    status_filter: ProcessingStatus | None = None,
-    db: Session = Depends(get_db),
-) -> Envelope:
-    if page < 1 or page_size < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ErrorResponse(
-                code="invalid_pagination",
-                message="Page and page_size must be positive integers.",
-            ).model_dump(),
-        )
+def _enqueue_processing(job_id: int) -> None:
+    try:
+        from app.services.video_processor import enqueue_job
+        enqueue_job(job_id)
+    except Exception as exc:
+        logger.warning(f"Could not enqueue job {job_id}: {exc}")
 
-    query = db.query(VideoJobORM)
-    if status_filter:
-        query = query.filter(VideoJobORM.status == status_filter)
 
-    query = query.order_by(VideoJobORM.created_at.desc())
-    items = query.offset((page - 1) * page_size).limit(page_size).all()
-
-    data = [VideoJobListItem.model_validate(item) for item in items]
-    return Envelope(data=data)
-
+# ── get single job ────────────────────────────────────────────────────────────
 
 @router.get("/{job_id}", response_model=Envelope)
-def get_video_job(
-    job_id: int,
-    db: Session = Depends(get_db),
-) -> Envelope:
-    job = db.get(VideoJobORM, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ErrorResponse(
-                code="not_found", message="Video job not found."
-            ).model_dump(),
-        )
+def get_video(job_id: int, db: Session = Depends(get_db)) -> Envelope:
+    return Envelope(data=VideoJob.model_validate(_job_or_404(job_id, db)))
 
-    return Envelope(data=VideoJob.model_validate(job))
 
+# ── result ────────────────────────────────────────────────────────────────────
 
 @router.get("/{job_id}/result", response_model=Envelope)
-def get_video_result(
-    job_id: int,
-    db: Session = Depends(get_db),
-) -> Envelope:
-    job = db.get(VideoJobORM, job_id)
-    if not job:
+def get_video_result(job_id: int, db: Session = Depends(get_db)) -> Envelope:
+    job = _job_or_404(job_id, db)
+    result = db.query(VideoResultORM).filter_by(job_id=job_id).first()
+    if not result:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=ErrorResponse(
-                code="not_found", message="Video job not found."
-            ).model_dump(),
+            detail=ErrorResponse(code="not_found", message="No result yet.").model_dump(),
         )
 
-    if job.status != ProcessingStatus.completed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ErrorResponse(
-                code="not_completed",
-                message="Video job is not completed yet.",
-                details={"status": job.status},
-            ).model_dump(),
-        )
+    artifacts = _find_artifacts(job)
+    raw = result.raw_json or {}
+    metrics = dict(raw.get("metrics") or {})
 
-    db_result = db.query(VideoResultORM).filter_by(job_id=job_id).first()
-    if not db_result:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ErrorResponse(
-                code="result_not_found",
-                message="No result found for this job.",
-            ).model_dump(),
-        )
+    # Safely get plates_detected (new column, may be None on old rows)
+    plates_detected = getattr(result, "plates_detected", None) or 0
+    if plates_detected:
+        metrics["plates_detected"] = plates_detected
 
-    base = VideoResult.model_validate(db_result).model_dump()
-    raw_json = db_result.raw_json or {}
-    artifact_paths = [
-        det.get("artifact_path")
-        for det in raw_json.get("detections", [])
-        if det.get("artifact_path")
-    ]
-    artifacts = [
-        {
-            "filename": Path(item).name,
-            "url": _artifact_url(job_id, Path(item).name),
-        }
-        for item in artifact_paths
-    ]
-
-    enriched = VideoResultWithArtifacts(
-        **base,
-        artifacts=artifacts,
-        metrics=raw_json.get("metrics"),
-    )
-    return Envelope(data=enriched)
+    return Envelope(data={
+        "id": result.id,
+        "job_id": job_id,
+        "summary": result.summary or "",
+        "raw_json": raw,
+        "created_at": result.created_at.isoformat(),
+        "artifacts": artifacts or None,
+        "metrics": metrics or None,
+    })
 
 
-@router.get("/{job_id}/logs", response_model=Envelope)
-def get_video_logs(
-    job_id: int,
-    limit: int = 200,
-    db: Session = Depends(get_db),
-) -> Envelope:
-    job = db.get(VideoJobORM, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ErrorResponse(code="not_found", message="Video job not found.").model_dump(),
-        )
+# ── frames ────────────────────────────────────────────────────────────────────
 
-    log_path = Path(job.log_path) if job.log_path else None
-    limit = max(1, min(limit, 500))
-    entries = _read_log_entries(log_path, limit) if log_path else []
-    return Envelope(
-        data={
-            "job_id": job.id,
-            "entries": entries,
-        }
-    )
+@router.get("/{job_id}/frames", response_model=Envelope)
+def get_frames(job_id: int, db: Session = Depends(get_db)) -> Envelope:
+    job = _job_or_404(job_id, db)
+    result = db.query(VideoResultORM).filter_by(job_id=job_id).first()
 
+    if not result or not result.raw_json:
+        # Fallback: build frames from artifacts on disk
+        artifacts = _find_artifacts(job)
+        frames = [{"url": a["url"], "timestamp": 0, "confidence": 0,
+                   "vehicle_id": None, "bbox": [], "plate_number": None,
+                   "plate_confidence": 0.0} for a in artifacts]
+        return Envelope(data={"frames": frames})
+
+    detections = result.raw_json.get("detections") or []
+    frames = []
+    for det in detections:
+        art = det.get("artifact_path")
+        if not art:
+            continue
+        art_path = Path(art)
+        try:
+            rel = art_path.relative_to(BASE_DIR / "storage")
+            url = _artifact_url(str(rel))
+        except ValueError:
+            url = f"/static/storage/videos/{job_id}/artifacts/{art_path.name}"
+
+        frames.append({
+            "url": url,
+            "timestamp": det.get("timestamp", 0),
+            "confidence": det.get("confidence", 0),
+            "vehicle_id": det.get("vehicle_id"),
+            "bbox": list(det.get("bbox") or []),
+            "plate_number": det.get("plate_number"),
+            "plate_confidence": det.get("plate_confidence", 0.0),
+        })
+
+    return Envelope(data={"frames": frames})
+
+
+# ── artifacts ─────────────────────────────────────────────────────────────────
 
 @router.get("/{job_id}/artifacts", response_model=Envelope)
-def list_video_artifacts(
-    job_id: int,
-    db: Session = Depends(get_db),
-) -> Envelope:
-    job = db.get(VideoJobORM, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ErrorResponse(code="not_found", message="Video job not found.").model_dump(),
-        )
-
-    artifact_dir = _resolve_artifact_dir(job)
-    items: list[dict[str, str]] = []
-    if artifact_dir.exists():
-        for path in sorted(artifact_dir.iterdir()):
-            if path.is_file():
-                items.append(
-                    {
-                        "filename": path.name,
-                        "url": _artifact_url(job.id, path.name),
-                    }
-                )
-    return Envelope(data={"items": items})
+def get_artifacts(job_id: int, db: Session = Depends(get_db)) -> Envelope:
+    job = _job_or_404(job_id, db)
+    return Envelope(data={"items": _find_artifacts(job)})
 
 
-@router.get("/{job_id}/artifacts/{filename}")
-def download_video_artifact(
-    job_id: int,
-    filename: str,
-    db: Session = Depends(get_db),
-):
-    job = db.get(VideoJobORM, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ErrorResponse(code="not_found", message="Video job not found.").model_dump(),
-        )
-    safe_name = Path(filename).name
-    if safe_name != filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ErrorResponse(code="invalid_filename", message="Invalid artifact path.").model_dump(),
-        )
-    artifact_dir = _resolve_artifact_dir(job)
-    artifact_path = artifact_dir / safe_name
-    if not artifact_path.exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ErrorResponse(code="artifact_not_found", message="Artifact not found.").model_dump(),
-        )
-    return FileResponse(artifact_path)
+# ── logs ──────────────────────────────────────────────────────────────────────
 
-
-
-
+@router.get("/{job_id}/logs", response_model=Envelope)
+def get_logs(job_id: int, limit: int = 200, db: Session = Depends(get_db)) -> Envelope:
+    job = _job_or_404(job_id, db)
+    entries: list[dict] = []
+    if job.log_path:
+        log_path = Path(job.log_path)
+        if log_path.exists():
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines[-limit:]:
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    entries.append({"timestamp": 0, "event": "log", "message": line})
+    return Envelope(data={"job_id": job_id, "entries": entries})
