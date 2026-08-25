@@ -16,3 +16,4 @@ storage/logs/
 *.pt
 
 .env
+.env
